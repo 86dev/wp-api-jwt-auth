@@ -75,11 +75,29 @@ class Jwt_Auth_Public
         register_rest_route($this->namespace, 'token', array(
             'methods' => 'POST',
             'callback' => array($this, 'generate_token'),
+			'permission_callback' => '__return_true',
+			'args' => array(
+				'username' => array(
+					'type' => 'string',
+					'required' => true,
+				),
+				'password' => array(
+					'type' => 'string',
+					'required' => true,
+				),
+			)
         ));
 
         register_rest_route($this->namespace, 'token/validate', array(
             'methods' => 'POST',
             'callback' => array($this, 'validate_token'),
+			'permission_callback' => '__return_true'
+        ));
+
+        register_rest_route($this->namespace, 'token/renew', array(
+            'methods' => 'POST',
+			'callback' => array($this, 'renew_token'),
+			'permission_callback' => '__return_true'
         ));
     }
 
@@ -93,22 +111,19 @@ class Jwt_Auth_Public
             $headers = apply_filters('jwt_auth_cors_allow_headers', 'Access-Control-Allow-Headers, Content-Type, Authorization');
             header(sprintf('Access-Control-Allow-Headers: %s', $headers));
         }
-    }
+	}
 
-    /**
-     * Get the user and password in the request body and generate a JWT
-     *
-     * @param [type] $request [description]
-     *
-     * @return [type] [description]
-     */
-    public function generate_token($request)
-    {
-        $secret_key = defined('JWT_AUTH_SECRET_KEY') ? JWT_AUTH_SECRET_KEY : false;
-        $username = $request->get_param('username');
-        $password = $request->get_param('password');
-
+	/**
+	 * Create a token and return a rest response.
+	 *
+	 * @param WP_User $user
+	 *
+	 * @return WP_REST_Response|WP_Error
+	 */
+	protected function get_token($user)
+	{
         /** First thing, check the secret key if not exist return a error*/
+        $secret_key = defined('JWT_AUTH_SECRET_KEY') ? JWT_AUTH_SECRET_KEY : false;
         if (!$secret_key) {
             return new WP_Error(
                 'jwt_auth_bad_config',
@@ -117,29 +132,14 @@ class Jwt_Auth_Public
                     'status' => 403,
                 )
             );
-        }
-        /** Try to authenticate the user with the passed credentials*/
-        $user = wp_authenticate($username, $password);
+		}
 
-        /** If the authentication fails return a error*/
-        if (is_wp_error($user)) {
-            $error_code = $user->get_error_code();
-            return new WP_Error(
-                '[jwt_auth] ' . $error_code,
-                $user->get_error_message($error_code),
-                array(
-                    'status' => 403,
-                )
-            );
-        }
-
-        /** Valid credentials, the user exists create the according Token */
-        $issuedAt = time();
+		$issuedAt = apply_filters('jwt_auth_issued_at', time());
         $notBefore = apply_filters('jwt_auth_not_before', $issuedAt, $issuedAt);
         $expire = apply_filters('jwt_auth_expire', $issuedAt + (DAY_IN_SECONDS * 7), $issuedAt);
 
         $token = array(
-            'iss' => get_bloginfo('url'),
+            'iss' => apply_filters('jwt_auth_issuer', get_bloginfo('url')),
             'iat' => $issuedAt,
             'nbf' => $notBefore,
             'exp' => $expire,
@@ -163,15 +163,67 @@ class Jwt_Auth_Public
 
         /** Let the user modify the data before send it back */
         return apply_filters('jwt_auth_token_before_dispatch', $data, $user);
+	}
+
+    /**
+     * Get the user and password in the request body and generate a JWT
+     *
+     * @param WP_REST_Request $request
+     *
+     * @return WP_REST_Response|WP_Error
+     */
+    public function generate_token($request)
+    {
+        /** Try to authenticate the user with the passed credentials*/
+        $username = $request->get_param('username');
+        $password = $request->get_param('password');
+        $user = wp_authenticate($username, $password);
+
+        /** If the authentication fails return a error*/
+        if (is_wp_error($user)) {
+            $error_code = $user->get_error_code();
+            return new WP_Error(
+                '[jwt_auth] ' . $error_code,
+                $user->get_error_message($error_code),
+                array(
+                    'status' => 403,
+                )
+            );
+        }
+
+		/** Valid credentials, the user exists create the according Token */
+		return $this->get_token($user);
     }
+
+    /**
+     * Get the current JWT token in the request and renew it
+     *
+     * @param WP_REST_Request $request
+     *
+     * @return array
+     */
+    public function renew_token($request)
+    {
+		$token = $this->validate_token(false);
+		if (is_wp_error($token)) {
+			return $token;
+		}
+
+		/** Valid credentials, the user exists create the according Token */
+		$user = get_user_by('ID', $token->data->user->id);
+		if (!$user) {
+			return new WP_Error('[jwt_auth] unknown user', __('User unknown', 'wp-api-jwt-auth'), ['status' => 403]);
+		}
+		return $this->get_token($user);
+	}
 
     /**
      * This is our Middleware to try to authenticate the user according to the
      * token send.
      *
-     * @param (int|bool) $user Logged User ID
+     * @param int|bool $user Logged User ID
      *
-     * @return (int|bool)
+     * @return int|bool
      */
     public function determine_current_user($user)
     {
@@ -216,9 +268,9 @@ class Jwt_Auth_Public
      * Main validation function, this function try to get the Autentication
      * headers and decoded.
      *
-     * @param bool $output
+     * @param bool $output False to return the token, false to get a WP_Rest_Response
      *
-     * @return WP_Error | Object | Array
+     * @return WP_Error|WP_Rest_Response|object
      */
     public function validate_token($output = true)
     {
@@ -236,7 +288,7 @@ class Jwt_Auth_Public
         if (!$auth) {
             return new WP_Error(
                 'jwt_auth_no_auth_header',
-                'Authorization header not found.',
+                __('Authorization header not found.', 'wp-api-jwt-auth'),
                 array(
                     'status' => 403,
                 )
@@ -251,7 +303,7 @@ class Jwt_Auth_Public
         if (!$token) {
             return new WP_Error(
                 'jwt_auth_bad_auth_header',
-                'Authorization header malformed.',
+                __('Authorization header malformed.', 'wp-api-jwt-auth'),
                 array(
                     'status' => 403,
                 )
@@ -263,7 +315,7 @@ class Jwt_Auth_Public
         if (!$secret_key) {
             return new WP_Error(
                 'jwt_auth_bad_config',
-                'JWT is not configurated properly, please contact the admin',
+                __('JWT is not configurated properly, please contact the admin', 'wp-api-jwt-auth'),
                 array(
                     'status' => 403,
                 )
@@ -274,11 +326,11 @@ class Jwt_Auth_Public
         try {
             $token = JWT::decode($token, $secret_key, array('HS256'));
             /** The Token is decoded now validate the iss */
-            if ($token->iss != get_bloginfo('url')) {
+            if ($token->iss != apply_filters('jwt_auth_issuer', get_bloginfo('url'))) {
                 /** The iss do not match, return error */
                 return new WP_Error(
                     'jwt_auth_bad_iss',
-                    'The iss do not match with this server',
+                    __('The iss do not match with this server', 'wp-api-jwt-auth'),
                     array(
                         'status' => 403,
                     )
@@ -289,7 +341,7 @@ class Jwt_Auth_Public
                 /** No user id in the token, abort!! */
                 return new WP_Error(
                     'jwt_auth_bad_request',
-                    'User ID not found in the token',
+                    __('User ID not found in the token', 'wp-api-jwt-auth'),
                     array(
                         'status' => 403,
                     )
